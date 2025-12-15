@@ -39,3 +39,19 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+
+# Security: Ignore all environment files
+.env
+.env.local
+.env.*
+
+# Dependencies (Too heavy to upload)
+node_modules/
+venv/
+__pycache__/
+.DS_Store
+
+# IDE Settings
+.vscode/
+.idea/
