@@ -7,7 +7,7 @@ interface ChatInterfaceProps {
   messages: Message[];
   inputValue: string;
   setInputValue: (value: string) => void;
-  onSend: () => void;
+  onSend: (text?: string) => void;
   listeningStatus: string;
   transcript: string;
 }
@@ -33,7 +33,10 @@ export default function ChatInterface({
   const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      onSend();
+      if (inputValue.trim()) {
+        onSend(inputValue.trim());
+        setInputValue("");
+      }
     }
   };
 
@@ -82,7 +85,15 @@ export default function ChatInterface({
             onKeyDown={handleInputKeyDown}
             suppressHydrationWarning
           />
-          <button onClick={onSend} className="rounded-full p-[13px] ml-1 hover:bg-[#fbecd8]">
+          <button 
+            onClick={() => {
+              if (inputValue.trim()) {
+                onSend(inputValue.trim());
+                setInputValue("");
+              }
+            }} 
+            className="rounded-full p-[13px] ml-1 hover:bg-[#fbecd8]"
+          >
             <FiSend size={22} color="#bb601f" />
           </button>
           
