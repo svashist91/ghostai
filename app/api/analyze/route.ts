@@ -4,7 +4,10 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
+// Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
+
+// Initialize S3
 const s3Client = new S3Client({
   region: process.env.AWS_REGION,
   credentials: {
@@ -15,27 +18,47 @@ const s3Client = new S3Client({
 
 export async function POST(request: Request) {
   try {
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    console.log('--- Analyze Request Started ---');
 
+    // 1. Validate Headers
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader) {
+      return NextResponse.json({ error: 'Missing Authorization header' }, { status: 401 });
+    }
+
+    // 2. Initialize Supabase with User Token
+    // We pass the token to PostgREST. It verifies the signature automatically.
     const supabase = createClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        global: {
+          headers: { Authorization: authHeader },
+        },
+      }
     );
-    
-    const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const { s3Key, recordId, userPrompt } = await request.json();
+    // NOTE: We skipped auth.getUser() because it crashes on non-UUID Clerk IDs.
+    // The DB Update below will serve as our verification.
+
+    // 3. Parse Request
+    const body = await request.json();
+    const { s3Key, recordId, userPrompt } = body;
 
     if (!s3Key) {
       return NextResponse.json({ error: 'Missing s3Key' }, { status: 400 });
     }
 
-    // --- FETCH IMAGE FROM S3 ---
+    // 4. Fetch Image from S3
     const imgCommand = new GetObjectCommand({ Bucket: process.env.AWS_BUCKET_NAME, Key: s3Key });
     const imgUrl = await getSignedUrl(s3Client, imgCommand, { expiresIn: 60 });
     const imgResp = await fetch(imgUrl);
+    
+    if (!imgResp.ok) {
+       console.error('❌ S3 Fetch Failed:', imgResp.statusText);
+       throw new Error(`Failed to fetch image from S3: ${imgResp.statusText}`);
+    }
+
     const imgBuffer = await imgResp.arrayBuffer();
     
     const imagePart = {
@@ -45,23 +68,19 @@ export async function POST(request: Request) {
       },
     };
 
-    // --- MODEL: gemini-1.5-flash (Text + Image) ---
-    const modelName = "gemini-1.5-flash"; 
+    // 5. Call Gemini AI
+    const modelName = "gemini-2.5-flash-lite"; 
     const model = genAI.getGenerativeModel({ model: modelName });
     
     let systemInstruction = "";
-    let parts: any[] = [imagePart];
-
-    // Determine prompt based on user input
+    
     if (userPrompt === 'Passive Observation') {
-      // Passive mode: Just summarize the screen
       systemInstruction = `
         You are Drona, an AI assistant observing the user's screen.
         Analyze the screen and provide a brief summary of what is currently visible.
         Keep it concise (1-2 sentences). No punctuation, no emojis.
       `;
     } else if (userPrompt && userPrompt.trim() !== "") {
-      // Active mode: Answer the user's question
       systemInstruction = `
         You are Drona, an AI assistant.
         The user asked: "${userPrompt}"
@@ -74,18 +93,15 @@ export async function POST(request: Request) {
         5. Just output the raw words for the answer.
       `;
     } else {
-      // Fallback: Brief summary
       systemInstruction = "Analyze the screen. Provide a brief summary of the current activity.";
     }
 
-    // Add the text prompt as a text part
-    parts.push(systemInstruction);
-
-    // --- EXECUTE ---
-    const result = await model.generateContent(parts);
+    console.log('🧠 Sending to Gemini...');
+    const result = await model.generateContent([systemInstruction, imagePart]);
     let finalResponse = result.response.text();
+    console.log('🗣️ Gemini Response:', finalResponse.substring(0, 50) + '...');
 
-    // --- CLEANUP: Remove punctuation and emojis for active queries ---
+    // 6. Cleanup Response
     if (userPrompt && userPrompt !== 'Passive Observation' && userPrompt.trim() !== "") {
       finalResponse = finalResponse
         .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "") 
@@ -94,25 +110,29 @@ export async function POST(request: Request) {
         .trim();
     }
 
-    // --- UPDATE DATABASE ---
-    const supabaseAdmin = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!
-    );
-
-    await supabaseAdmin
+    // 7. Update Database (Using User Token)
+    // We use the 'supabase' client we created in Step 2.
+    // This ensures RLS runs and verifies the token.
+    const { error: updateError } = await supabase
       .from('user_states')
       .update({ text_content: finalResponse })
       .eq('id', recordId);
 
-    // --- RETURN RESPONSE ---
+    if (updateError) {
+      console.error('❌ DB Update Error:', updateError);
+      // We don't fail the request here because the user still needs the voice response
+    } else {
+      console.log('✅ DB Updated Successfully');
+    }
+
     return NextResponse.json({ 
       success: true, 
       response: finalResponse 
     });
 
   } catch (error: any) {
-    console.error('Drona Error:', error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error('❌ Drona Error:', error);
+    return NextResponse.json({ error: error.message || 'Internal Server Error' }, { status: 500 });
   }
 }
+

@@ -3,10 +3,10 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { useChatSessions } from "./hooks/useChatSessions";
 import Sidebar from "./components/Sidebar";
 import ChatInterface from "./components/ChatInterface";
-import { createBrowserClient } from "@/utils/supabase/client";
 import Link from "next/link";
-import { SignedIn, UserButton } from "@clerk/nextjs";
-import { FiCreditCard } from "react-icons/fi";
+import { FiCreditCard, FiLogOut } from "react-icons/fi";
+import { useSession, useUser, useClerk, SignIn } from '@clerk/nextjs';
+import { createClerkSupabaseClient } from '@/utils/supabase/client';
 
 // Speech Recognition types
 declare global {
@@ -16,13 +16,14 @@ declare global {
   }
 }
 
+
 export default function Home() {
-  const supabase = createBrowserClient();
+  const { session } = useSession();
+  const { user } = useUser();
+  const { signOut } = useClerk();
   
-  // --- AUTH STATE ---
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [user, setUser] = useState<any>(null);
+  // Create the authenticated client
+  const supabase = createClerkSupabaseClient(session);
   
   // --- DRONA STATE ---
   const [mode, setMode] = useState<'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING'>('IDLE');
@@ -43,6 +44,14 @@ export default function Home() {
   const sessionIdRef = useRef<number>(0);
   const activeSessionIdRef = useRef<number>(0);
   
+  // --- INTERACTION TRACKING ---
+  const interactionCountRef = useRef<number>(0);
+  const queryStartTimeRef = useRef<number>(0);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  
+  // --- AUTH TOKEN CACHE ---
+  const latestTokenRef = useRef<string | null>(null);
+  
   // --- CHAT SESSIONS ---
   const {
     sessions,
@@ -54,32 +63,17 @@ export default function Home() {
   } = useChatSessions(() => {});
 
   // --- LOGGING ---
-  const addLog = (msg: string) => {
+  const addLog = (message: string, tag?: string, interactionId?: number) => {
     const timestamp = new Date().toLocaleTimeString();
-    setLogs((prev) => [`[${timestamp}] ${msg}`, ...prev].slice(0, 50)); // Keep last 50 logs
+    const intId = interactionId !== undefined ? `[INT-${interactionId}]` : '';
+    const tagStr = tag ? `[${tag}]` : '';
+    const formattedLog = `[${timestamp}] ${intId} ${tagStr} ${message}`.trim();
+    setLogs((prev) => [...prev, formattedLog].slice(-100)); // Keep last 100 logs
   };
 
   // --- SESSION VALIDATION ---
   const isValidSession = (sessionId: number): boolean => {
     return sessionId === activeSessionIdRef.current && !isStoppingRef.current;
-  };
-
-  // --- AUTH ---
-  const handleLogin = async () => {
-    addLog('🔐 Attempting login...');
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) {
-      const { data: up, error: upError } = await supabase.auth.signUp({ email, password });
-      if (!upError) { 
-        setUser(up.user);
-        addLog('✅ SignUp Success!');
-      } else {
-        addLog(`❌ SignUp Error: ${upError.message}`);
-      }
-    } else {
-      setUser(data.user);
-      addLog(`✅ Logged in as ${data.user?.email}`);
-    }
   };
 
   // --- CAPTURE SCREEN IMAGE ---
@@ -164,19 +158,33 @@ export default function Home() {
         // If we have a final result, process it
         if (finalTranscript.trim()) {
           const transcript = finalTranscript.trim();
-          addLog(`🗣️ Voice detected: "${transcript}"`);
+          
+          // Check guard clause: if already processing, ignore input
+          if (modeRef.current === 'PROCESSING') {
+            const currentInteractionId = interactionCountRef.current;
+            addLog(`🛑 Ignored input "${transcript}" because Drona is already thinking.`, 'GUARD', currentInteractionId);
+            return;
+          }
+          
+          // Start of new interaction: increment counter and set start time
+          interactionCountRef.current += 1;
+          queryStartTimeRef.current = Date.now();
+          const currentInteractionId = interactionCountRef.current;
+          
+          addLog(`❓ User asked: "${transcript}"`, 'VOICE', currentInteractionId);
+          addLog(`🔄 Transition: LISTENING -> PROCESSING`, 'STATE', currentInteractionId);
           
           // BARGE-IN: Cancel any ongoing speech
           setMode((currentMode) => {
             if (currentMode === 'SPEAKING') {
               window.speechSynthesis.cancel();
-              addLog('🛑 Interrupted speech to listen');
+              addLog('🛑 Interrupted speech to listen', 'VOICE', currentInteractionId);
             }
             return currentMode;
           });
 
           // Process the active query
-          processActiveQuery(transcript, currentSessionId);
+          processActiveQuery(transcript, currentSessionId, currentInteractionId);
         }
       };
 
@@ -352,15 +360,21 @@ export default function Home() {
         canvas.toBlob(async (imageBlob) => {
           if (!imageBlob || !isValidSession(sessionId)) return;
           
-          const { data: { session } } = await supabase.auth.getSession();
-          const token = session?.access_token;
+          let token = latestTokenRef.current;
+          if (!token && session) {
+            token = await session.getToken({ template: 'supabase' });
+            latestTokenRef.current = token;
+          }
           if (!token) return;
 
           // Upload image
           const resImg = await fetch('/api/upload', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ contentType: 'image/png' })
+            body: JSON.stringify({ 
+              contentType: 'image/png',
+              sessionId: currentSessionId
+            })
           }).then(r => r.json());
 
           await fetch(resImg.url, { 
@@ -370,13 +384,19 @@ export default function Home() {
           });
 
           // Create DB record
-          const { data: dbData } = await supabase.from('user_states')
+          const { data: dbData, error: dbError } = await supabase.from('user_states')
             .insert({ 
               user_id: user.id, 
               text_content: 'Passive Observation...', 
               screen_image_path: resImg.key 
             })
             .select().single();
+
+          if (dbError || !dbData) {
+            // Just log to console for passive loop, no need to alert user
+            console.error('Passive DB Insert Error:', dbError);
+            return;
+          }
 
           if (!isValidSession(sessionId)) return;
 
@@ -404,7 +424,7 @@ export default function Home() {
   };
 
   // --- PROCESS ACTIVE QUERY ---
-  const processActiveQuery = async (transcript: string, sessionId: number) => {
+  const processActiveQuery = async (transcript: string, sessionId: number, interactionId: number) => {
     if (!isValidSession(sessionId) || !videoRef.current || !user || !currentSessionId) {
       return;
     }
@@ -412,12 +432,13 @@ export default function Home() {
     try {
       setMode('PROCESSING');
       modeRef.current = 'PROCESSING';
-      addLog('📸 Capturing screenshot...');
+      addLog('📸 Capturing screenshot...', 'PROCESS', interactionId);
 
       // Set timeout safety (15 seconds)
       processingTimeoutRef.current = setTimeout(() => {
         if (modeRef.current === 'PROCESSING' && isValidSession(sessionId)) {
-          addLog('⏱️ Processing timeout! Resetting...');
+          const latency = Date.now() - queryStartTimeRef.current;
+          addLog(`⏱️ Processing timeout! Resetting... (Latency: ${latency}ms)`, 'ERROR', interactionId);
           setMode('LISTENING');
           modeRef.current = 'LISTENING';
           updateSessionMessages(currentSessionId, (prev) => [
@@ -428,7 +449,7 @@ export default function Home() {
             }
           ]);
         }
-      }, 15000);
+      }, 30000);
 
       // Add user message to chat
       updateSessionMessages(currentSessionId, (prev) => [
@@ -452,9 +473,11 @@ export default function Home() {
       }
       
       ctx.drawImage(videoRef.current, 0, 0);
-      addLog('📸 Screenshot captured');
+      addLog(`📸 Screenshot captured (Size: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight})`, 'PROCESS', interactionId);
 
       canvas.toBlob(async (imageBlob) => {
+        addLog('🔍 Blob created, fetching auth token...', 'PROCESS', interactionId);
+        
         if (!imageBlob || !isValidSession(sessionId)) {
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
           setMode('LISTENING');
@@ -462,8 +485,13 @@ export default function Home() {
           return;
         }
         
-        const { data: { session } } = await supabase.auth.getSession();
-        const token = session?.access_token;
+        let token = latestTokenRef.current;
+        if (!token && session) {
+          token = await session.getToken({ template: 'supabase' });
+          latestTokenRef.current = token;
+        }
+        addLog('🔑 Auth token received', 'PROCESS', interactionId);
+        
         if (!token || !isValidSession(sessionId)) {
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
           setMode('LISTENING');
@@ -471,18 +499,22 @@ export default function Home() {
           return;
         }
 
-        addLog('☁️ Uploading image...');
+        addLog('☁️ Uploading image...', 'PROCESS', interactionId);
 
         // Upload image
         const resImg = await fetch('/api/upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ contentType: 'image/png' })
+          body: JSON.stringify({ 
+            contentType: 'image/png',
+            sessionId: currentSessionId
+          })
         }).then(r => r.json());
 
         if (!isValidSession(sessionId)) {
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
           setMode('LISTENING');
+          modeRef.current = 'LISTENING';
           return;
         }
 
@@ -492,16 +524,25 @@ export default function Home() {
           headers: { 'Content-Type': 'image/png' } 
         });
 
-        addLog('💾 Creating database record...');
+        addLog('💾 Creating database record...', 'PROCESS', interactionId);
 
-        // Create DB record
-        const { data: dbData } = await supabase.from('user_states')
-          .insert({ 
-            user_id: user.id, 
-            text_content: transcript, 
-            screen_image_path: resImg.key 
-          })
-          .select().single();
+          // Create DB record
+          const { data: dbData, error: dbError } = await supabase.from('user_states')
+            .insert({ 
+              user_id: user.id, 
+              text_content: transcript, 
+              screen_image_path: resImg.key 
+            })
+            .select().single();
+
+        if (dbError || !dbData) {
+          addLog(`❌ DB Error: ${dbError?.message || 'Insert failed'}`, 'ERROR', interactionId);
+          // Clean up and exit
+          if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
+          setMode('LISTENING');
+          modeRef.current = 'LISTENING';
+          return;
+        }
 
         if (!isValidSession(sessionId)) {
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
@@ -510,7 +551,7 @@ export default function Home() {
           return;
         }
 
-        addLog('🧠 Sending to API...');
+        addLog('📡 Sending request to backend...', 'API', interactionId);
 
         // Call API with text + image
         const resAnalyze = await fetch('/api/analyze', {
@@ -526,6 +567,7 @@ export default function Home() {
         if (!isValidSession(sessionId)) {
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
           setMode('LISTENING');
+          modeRef.current = 'LISTENING';
           return;
         }
 
@@ -536,10 +578,11 @@ export default function Home() {
         }
 
         const analysis = await resAnalyze.json();
+        const latency = Date.now() - queryStartTimeRef.current;
 
         if (!resAnalyze.ok || analysis.error) {
           if (isValidSession(sessionId)) {
-            addLog(`❌ API Error: ${analysis.error || 'Unknown Error'}`);
+            addLog(`❌ Error: ${analysis.error || 'Unknown Error'} (Latency: ${latency}ms)`, 'API', interactionId);
             updateSessionMessages(currentSessionId, (prev) => [
               ...prev, 
               { 
@@ -547,7 +590,7 @@ export default function Home() {
                 content: `Error: ${analysis.error || 'Unknown Error'}` 
               }
             ]);
-            speakResponse("I'm sorry, I encountered an error.", sessionId); 
+            speakResponse("I'm sorry, I encountered an error.", sessionId, interactionId); 
           }
           return;
         }
@@ -557,7 +600,8 @@ export default function Home() {
         }
 
         const response = analysis.response || "I am silent."; 
-        addLog(`✅ Response received: "${response.substring(0, 30)}..."`);
+        addLog(`✅ Response received in ${latency}ms`, 'API', interactionId);
+        addLog(`💡 Drona: "${response.substring(0, 50)}${response.length > 50 ? '...' : ''}"`, 'AI', interactionId);
         
         // Add assistant message to chat
         updateSessionMessages(currentSessionId, (prev) => [
@@ -568,7 +612,7 @@ export default function Home() {
           }
         ]);
         
-        speakResponse(response, sessionId);
+        speakResponse(response, sessionId, interactionId);
 
       }, 'image/png');
 
@@ -578,7 +622,8 @@ export default function Home() {
         processingTimeoutRef.current = null;
       }
       if (isValidSession(sessionId)) {
-        addLog(`❌ Process Error: ${err.message}`);
+        const latency = Date.now() - queryStartTimeRef.current;
+        addLog(`❌ Process Error: ${err.message} (Latency: ${latency}ms)`, 'ERROR', interactionId);
         updateSessionMessages(currentSessionId, (prev) => [
           ...prev, 
           { 
@@ -593,14 +638,14 @@ export default function Home() {
   };
 
   // --- SPEAK RESPONSE ---
-  const speakResponse = (text: string, sessionId: number) => {
+  const speakResponse = (text: string, sessionId: number, interactionId: number) => {
     if (!isValidSession(sessionId)) {
       return;
     }
 
     if (!text || text.trim() === "") {
       if (isValidSession(sessionId)) {
-        addLog('⚠️ Empty response received');
+        addLog('⚠️ Empty response received', 'TTS', interactionId);
         setMode('LISTENING');
         modeRef.current = 'LISTENING';
       }
@@ -609,7 +654,8 @@ export default function Home() {
 
     setMode('SPEAKING');
     modeRef.current = 'SPEAKING';
-    addLog(`🗣️ Speaking: "${text.substring(0, 30)}..."`);
+    addLog('🔄 Transition: PROCESSING -> SPEAKING', 'STATE', interactionId);
+    addLog('🗣️ Started speaking...', 'TTS', interactionId);
     window.speechSynthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(text);
@@ -617,7 +663,8 @@ export default function Home() {
     
     utterance.onend = () => {
       if (isValidSession(sessionId) && !isStoppingRef.current && !isPaused) {
-        addLog('👂 Listening again...');
+        addLog('🤫 Finished speaking (Ready for next input)', 'TTS', interactionId);
+        addLog('🔄 Transition: SPEAKING -> LISTENING', 'STATE', interactionId);
         setMode('LISTENING');
         modeRef.current = 'LISTENING';
       }
@@ -625,7 +672,7 @@ export default function Home() {
     
     utterance.onerror = () => {
       if (isValidSession(sessionId) && !isStoppingRef.current) {
-        addLog('⚠️ Speech error');
+        addLog('⚠️ Speech error', 'TTS', interactionId);
         setMode('LISTENING');
         modeRef.current = 'LISTENING';
       }
@@ -657,8 +704,11 @@ export default function Home() {
       ]);
 
       try {
-        const { data: { session } } = await supabase.auth.getSession();
-        const token = session?.access_token;
+        let token = latestTokenRef.current;
+        if (!token && session) {
+          token = await session.getToken({ template: 'supabase' });
+          latestTokenRef.current = token;
+        }
         if (!token) return;
 
         // Upload image if available
@@ -678,7 +728,10 @@ export default function Home() {
                   const resImg = await fetch('/api/upload', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                    body: JSON.stringify({ contentType: 'image/png' })
+                    body: JSON.stringify({ 
+                      contentType: 'image/png',
+                      sessionId: currentSessionId
+                    })
                   }).then(r => r.json());
                   await fetch(resImg.url, { 
                     method: 'PUT', 
@@ -754,51 +807,38 @@ export default function Home() {
     };
   }, []);
 
-  // --- CHECK AUTH ON MOUNT ---
+  // --- AUTO-SCROLL LOGS ---
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session?.user) {
-        setUser(session.user);
-      }
-    });
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [logs]);
 
-    supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-    });
-  }, [supabase]);
+  // --- BACKGROUND TOKEN REFRESH ---
+  useEffect(() => {
+    if (!session) return;
+
+    const fetchToken = async () => {
+      try {
+        const token = await session.getToken({ template: 'supabase' });
+        latestTokenRef.current = token;
+      } catch (e) {
+        console.error('Token refresh failed', e);
+      }
+    };
+
+    fetchToken(); // Initial fetch
+    const interval = setInterval(fetchToken, 55000); // Refresh every 55s
+
+    return () => clearInterval(interval);
+  }, [session]);
 
   // --- RENDER LOGIN SCREEN ---
   if (!user) {
     return (
       <main className="flex h-screen w-full items-center justify-center bg-[#FAF8F7] font-sans">
-        <div className="bg-white rounded-2xl border-2 border-[#EBE6DC] p-8 shadow-lg max-w-md w-full">
-          <h1 className="text-3xl font-bold mb-6 text-center text-[#231C16]">
-            <span className="text-[#bb601f]">AI</span>&nbsp;Workspace
-          </h1>
-          <div className="space-y-4">
-            <input 
-              className="w-full border border-[#EBE6DC] rounded-lg p-3 text-[#231C16]" 
-              placeholder="Email" 
-              type="email"
-              value={email}
-              onChange={e => setEmail(e.target.value)} 
-              suppressHydrationWarning 
-            />
-            <input 
-              className="w-full border border-[#EBE6DC] rounded-lg p-3 text-[#231C16]" 
-              type="password" 
-              placeholder="Password" 
-              value={password}
-              onChange={e => setPassword(e.target.value)} 
-              suppressHydrationWarning 
-            />
-            <button 
-              onClick={handleLogin} 
-              className="w-full bg-gradient-to-r from-[#fcab59] to-[#e97d2b] text-white font-bold py-3 rounded-lg shadow-lg hover:from-[#e19655] transition"
-            >
-              Connect
-            </button>
-          </div>
+        <div className="flex items-center justify-center w-full">
+          <SignIn />
         </div>
       </main>
     );
@@ -808,7 +848,7 @@ export default function Home() {
   return (
     <main className="flex h-screen w-full overflow-hidden relative bg-[#FAF8F7] font-inter text-[#231C16]">
       {/* Hidden video for Drona vision */}
-      <video ref={videoRef} className="hidden" muted playsInline></video>
+      <video ref={videoRef} className="absolute opacity-0 pointer-events-none w-1 h-1" muted playsInline></video>
 
       <Sidebar
         sessions={sessions}
@@ -830,19 +870,33 @@ export default function Home() {
       <aside className="w-[265px] flex flex-col px-7 py-10 bg-[#F3F2F1] h-full border-l border-[#EBEBEB] gap-6 font-sans">
         {/* Top: Account & Subscription */}
         <div className="flex flex-col gap-2">
-          <SignedIn>
-            <div className="flex items-center justify-center gap-3 w-full py-2 px-4 rounded-xl bg-white border border-[#ebd6c2] shadow-sm">
-              <UserButton afterSignOutUrl="/" />
-              <span className="text-sm font-bold text-[#d47e21]">My Account</span>
+          {/* Account / Sign Out */}
+          <div className="flex items-center justify-between p-3 rounded-xl bg-white border border-[#ebd6c2] shadow-sm">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 font-bold">
+                {user?.primaryEmailAddress?.emailAddress?.[0]?.toUpperCase() || user?.emailAddresses[0]?.emailAddress?.[0]?.toUpperCase() || 'U'}
+              </div>
+              <span className="text-sm font-bold text-[#d47e21] truncate max-w-[100px]">
+                {user?.primaryEmailAddress?.emailAddress || user?.emailAddresses[0]?.emailAddress || 'User'}
+              </span>
             </div>
-            <Link
-              href="/pricing"
-              className="flex items-center justify-center gap-2 w-full py-2 px-4 rounded-xl bg-white border border-[#ebd6c2] shadow-sm hover:bg-[#fff9f2] transition text-sm font-bold text-[#d47e21]"
+            <button 
+              onClick={() => signOut()}
+              className="text-xs text-red-500 hover:text-red-700 font-semibold underline flex items-center gap-1"
             >
-              <FiCreditCard className="w-4 h-4" />
-              Subscription
-            </Link>
-          </SignedIn>
+              <FiLogOut className="w-3 h-3" />
+              Sign Out
+            </button>
+          </div>
+
+          {/* Subscription Link */}
+          <Link
+            href="/pricing"
+            className="flex items-center justify-center gap-2 w-full py-2 px-4 rounded-xl bg-white border border-[#ebd6c2] shadow-sm hover:bg-[#fff9f2] transition text-sm font-bold text-[#d47e21]"
+          >
+            <FiCreditCard className="w-4 h-4" />
+            Subscription
+          </Link>
         </div>
 
         {/* Middle: Drona Status Indicator & Debug Logs */}
@@ -872,12 +926,35 @@ export default function Home() {
               {logs.length === 0 ? (
                 <div className="text-gray-600">No logs yet...</div>
               ) : (
-                logs.map((log, i) => (
-                  <div key={i} className="mb-1 border-b border-gray-800 pb-1 last:border-0">
-                    {log}
-                  </div>
-                ))
+                logs.map((log, i) => {
+                  // Color-code tags
+                  let coloredLog = log;
+                  if (log.includes('[API]')) {
+                    coloredLog = log.replace('[API]', '<span class="text-yellow-400">[API]</span>');
+                  } else if (log.includes('[VOICE]')) {
+                    coloredLog = log.replace('[VOICE]', '<span class="text-blue-400">[VOICE]</span>');
+                  } else if (log.includes('[ERROR]') || log.includes('[GUARD]')) {
+                    coloredLog = log.replace(/\[(ERROR|GUARD)\]/g, '<span class="text-red-400">[$1]</span>');
+                  } else if (log.includes('[TTS]')) {
+                    coloredLog = log.replace('[TTS]', '<span class="text-cyan-400">[TTS]</span>');
+                  } else if (log.includes('[STATE]')) {
+                    coloredLog = log.replace('[STATE]', '<span class="text-purple-400">[STATE]</span>');
+                  } else if (log.includes('[AI]')) {
+                    coloredLog = log.replace('[AI]', '<span class="text-green-300">[AI]</span>');
+                  } else if (log.includes('[PROCESS]')) {
+                    coloredLog = log.replace('[PROCESS]', '<span class="text-orange-400">[PROCESS]</span>');
+                  }
+                  
+                  return (
+                    <div 
+                      key={i} 
+                      className="mb-1 border-b border-gray-800 pb-1 last:border-0"
+                      dangerouslySetInnerHTML={{ __html: coloredLog }}
+                    />
+                  );
+                })
               )}
+              <div ref={logsEndRef} />
             </div>
           </div>
         </div>

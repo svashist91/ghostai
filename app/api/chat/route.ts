@@ -36,7 +36,7 @@ export async function POST(req: Request) {
 
     // 3. Initialize Model with the "Brain"
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash", // Using your preferred 2.5 model
+      model: "gemini-2.5-flash-lite", // Using your preferred 2.5 model
       systemInstruction: systemPrompt,
     });
 
@@ -94,7 +94,7 @@ export async function POST(req: Request) {
   } catch (error: any) {
     console.error("🔴 API Error:", error);
     return NextResponse.json({ 
-      response: `Error: ${error.message}. (Check if model 'gemini-2.5-flash' is enabled in your project)` 
+      response: `Error: ${error.message}. (Check if model 'gemini-2.5-flash-lite' is enabled in your project)` 
     }, { status: 500 });
   }
 }
