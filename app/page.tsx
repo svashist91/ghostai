@@ -220,15 +220,17 @@ export default function Home() {
       recognition.onend = () => {
         if (!isValidSession(currentSessionId) || isStoppingRef.current || isPaused) return;
         
-        // Auto-restart if not stopped by user
-        if (!isStoppingRef.current && !isPaused) {
-          try {
-            recognition.start();
-            addLog('🔄 Auto-restarting recognition...');
-          } catch (e) {
-            // Already started or error, ignore
+        // Watchdog: Restart immediately if we are supposed to be listening
+        setTimeout(() => {
+          if (!isStoppingRef.current && !isPaused && speechRecognitionRef.current) {
+            try {
+              recognition.start();
+              // Optional: console.log('🔄 Watchdog restart');
+            } catch(e) { 
+              // Already started or error, ignore
+            }
           }
-        }
+        }, 100);
       };
 
       // Start recognition
@@ -429,12 +431,22 @@ export default function Home() {
       return;
     }
 
+    // Fix "Awkward Silence" - Wake Word Filter
+    const cleanText = transcript.trim().toLowerCase();
+    // Ignore very short triggers or just the name
+    if (cleanText.length < 2 || ['drona', 'hey drona', 'hi', 'hello'].includes(cleanText)) {
+      addLog('🚫 Ignoring wake word only', 'SYSTEM', interactionId);
+      setMode('LISTENING');
+      modeRef.current = 'LISTENING';
+      return;
+    }
+
     try {
       setMode('PROCESSING');
       modeRef.current = 'PROCESSING';
       addLog('📸 Capturing screenshot...', 'PROCESS', interactionId);
 
-      // Set timeout safety (15 seconds)
+      // Set timeout safety (12 seconds - fail fast)
       processingTimeoutRef.current = setTimeout(() => {
         if (modeRef.current === 'PROCESSING' && isValidSession(sessionId)) {
           const latency = Date.now() - queryStartTimeRef.current;
@@ -449,7 +461,7 @@ export default function Home() {
             }
           ]);
         }
-      }, 30000);
+      }, 12000);
 
       // Add user message to chat
       updateSessionMessages(currentSessionId, (prev) => [
@@ -662,12 +674,22 @@ export default function Home() {
     utterance.rate = 1.1;
     
     utterance.onend = () => {
-      if (isValidSession(sessionId) && !isStoppingRef.current && !isPaused) {
-        addLog('🤫 Finished speaking (Ready for next input)', 'TTS', interactionId);
-        addLog('🔄 Transition: SPEAKING -> LISTENING', 'STATE', interactionId);
-        setMode('LISTENING');
-        modeRef.current = 'LISTENING';
+      // 1. Barge-In Check (Keep existing logic)
+      if (interactionId !== interactionCountRef.current) {
+        addLog('🚫 TTS end ignored (New interaction started)', 'TTS', interactionId);
+        return;
       }
+      
+      // 2. Add "Ear Muff" Cooldown (THE FIX)
+      // Wait 1s before listening again to prevent hearing self-echo
+      setTimeout(() => {
+        if (isValidSession(sessionId) && !isStoppingRef.current && !isPaused) {
+          addLog('🤫 Finished speaking (Cooldown complete)', 'TTS', interactionId);
+          addLog('🔄 Transition: SPEAKING -> LISTENING', 'STATE', interactionId);
+          setMode('LISTENING');
+          modeRef.current = 'LISTENING';
+        }
+      }, 1000);
     };
     
     utterance.onerror = () => {
@@ -791,6 +813,21 @@ export default function Home() {
   const handleSwitchSession = useCallback((sessionId: string) => {
     switchToSession(sessionId);
   }, [switchToSession]);
+
+  // --- EXPORT LOGS ---
+  const handleExportLogs = () => {
+    if (logs.length === 0) {
+      alert("No logs to export!");
+      return;
+    }
+    const element = document.createElement("a");
+    const file = new Blob([logs.join("\n")], {type: 'text/plain'});
+    element.href = URL.createObjectURL(file);
+    element.download = `drona_debug_logs_${new Date().getTime()}.txt`;
+    document.body.appendChild(element); 
+    element.click();
+    document.body.removeChild(element);
+  };
 
   // --- HELPER FOR STATUS CIRCLE ---
   const getCircleColor = () => {
@@ -922,7 +959,7 @@ export default function Home() {
           {/* Debug Logs */}
           <div className="w-full">
             <div className="text-[10px] font-bold uppercase tracking-wide text-[#B6B0A5] mb-2">Debug Logs</div>
-            <div className="w-full h-48 bg-black text-green-400 font-mono text-xs p-3 overflow-auto rounded border border-[#EBEBEB]">
+            <div className="w-full h-64 bg-black text-green-400 font-mono text-xs p-3 overflow-y-auto rounded border border-[#EBEBEB]">
               {logs.length === 0 ? (
                 <div className="text-gray-600">No logs yet...</div>
               ) : (
@@ -961,6 +998,13 @@ export default function Home() {
 
         {/* Bottom: Control Buttons */}
         <div className="mt-auto flex flex-col gap-3">
+          {/* --- NEW EXPORT BUTTON --- */}
+          <button 
+            onClick={handleExportLogs}
+            className="text-[10px] uppercase font-bold text-gray-400 hover:text-gray-600 tracking-wide self-center mb-2"
+          >
+            ⬇ Export Logs
+          </button>
           <button 
             className={`w-full font-bold flex items-center justify-center gap-2 rounded-full py-4 text-white shadow-lg transition
               ${mode === 'IDLE' 
