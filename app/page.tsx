@@ -7,6 +7,8 @@ import Link from "next/link";
 import { FiCreditCard, FiLogOut } from "react-icons/fi";
 import { useSession, useUser, useClerk, SignIn } from '@clerk/nextjs';
 import { createClerkSupabaseClient } from '@/utils/supabase/client';
+import { GoogleGenAI, Modality } from "@google/genai";
+import { decode, decodeAudioData } from "../utils/audio-stream";
 
 // Speech Recognition types
 declare global {
@@ -15,7 +17,6 @@ declare global {
     webkitSpeechRecognition: any;
   }
 }
-
 
 export default function Home() {
   const { session } = useSession();
@@ -30,6 +31,7 @@ export default function Home() {
   const [isPaused, setIsPaused] = useState(false);
   const [inputValue, setInputValue] = useState("");
   const [logs, setLogs] = useState<string[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState("");
   
   // --- REFS ---
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -51,6 +53,11 @@ export default function Home() {
   
   // --- AUTH TOKEN CACHE ---
   const latestTokenRef = useRef<string | null>(null);
+  
+  // --- GEMINI LIVE ---
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const sessionRef = useRef<any>(null);
   
   // --- CHAT SESSIONS ---
   const {
@@ -74,6 +81,127 @@ export default function Home() {
   // --- SESSION VALIDATION ---
   const isValidSession = (sessionId: number): boolean => {
     return sessionId === activeSessionIdRef.current && !isStoppingRef.current;
+  };
+
+  // --- CONNECT TO GEMINI LIVE ---
+  const connectToGemini = async () => {
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext ||
+          (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
+
+      const client = new GoogleGenAI({
+        apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY,
+      });
+
+      // Connect
+      const result = await client.live.connect({
+        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        config: {
+          responseModalities: [Modality.AUDIO, Modality.TEXT],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
+          },
+          systemInstruction: {
+            parts: [{
+              text: "You are Drona, a helpful and knowledgeable male AI assistant. Speak with a confident, masculine tone. Keep your answers concise and conversational.",
+            }],
+          },
+        },
+        callbacks: {
+          onopen: () => addLog('🔗 Connected to Gemini Live', 'SYSTEM'),
+          onmessage: async (message: any) => {
+            const parts = message.serverContent?.modelTurn?.parts || [];
+            let hasAudio = false;
+            
+            for (const part of parts) {
+              // Audio Handling
+              if (part.inlineData) {
+                hasAudio = true;
+                try {
+                  const audioData = decode(part.inlineData.data);
+                  const audioBuffer = await decodeAudioData(
+                    audioData,
+                    audioContextRef.current!,
+                    24000,
+                    1
+                  );
+                  
+                  const source = audioContextRef.current!.createBufferSource();
+                  source.buffer = audioBuffer;
+                  source.connect(audioContextRef.current!.destination);
+                  
+                  const currentTime = audioContextRef.current!.currentTime;
+                  const startTime = Math.max(currentTime, nextStartTimeRef.current);
+                  source.start(startTime);
+                  
+                  const endTime = startTime + audioBuffer.duration;
+                  nextStartTimeRef.current = endTime;
+                  
+                  // Transition back to LISTENING when audio finishes
+                  source.onended = () => {
+                    const remainingTime = (endTime - audioContextRef.current!.currentTime) * 1000;
+                    if (remainingTime <= 0) {
+                      setTimeout(() => {
+                        if (modeRef.current === 'SPEAKING' && !isStoppingRef.current && !isPaused) {
+                          addLog('🤫 Finished speaking (Ready for next input)', 'TTS');
+                          addLog('🔄 Transition: SPEAKING -> LISTENING', 'STATE');
+                          setMode('LISTENING');
+                          modeRef.current = 'LISTENING';
+                        }
+                      }, 1000); 
+                    }
+                  };
+                } catch (e) {
+                  console.error('Audio decode error:', e);
+                }
+              }
+              
+              // Text Handling
+              if (part.text) {
+                setLiveTranscript(prev => prev + part.text);
+                if (currentSessionId) {
+                  updateSessionMessages(currentSessionId, (prev) => {
+                    const lastMessage = prev[prev.length - 1];
+                    if (lastMessage && lastMessage.role === 'ai') {
+                      return [...prev.slice(0, -1), { ...lastMessage, content: lastMessage.content + part.text }];
+                    } else {
+                      return [...prev, { role: 'ai', content: part.text }];
+                    }
+                  });
+                }
+              }
+            }
+            
+            // Fallback: If AI sends text but NO audio (rare, but happens)
+            if (!hasAudio && parts.length > 0 && modeRef.current === 'SPEAKING') {
+               // Use a simple timeout to reset state if no audio arrives
+               setTimeout(() => {
+                  if (modeRef.current === 'SPEAKING') {
+                    setMode('LISTENING');
+                    modeRef.current = 'LISTENING';
+                  }
+               }, 3000);
+            }
+          },
+          onerror: (err: any) => addLog(`❌ Gemini Error: ${err.message}`, 'ERROR'),
+        }
+      });
+
+      // --- CRITICAL FIX: CHECK RETURN VALUE ---
+      console.log("⚠️ DEBUG: Connect returned:", result);
+      
+      // If the result contains 'session', use that. Otherwise use the result itself.
+      // @ts-ignore
+      const actualSession = result.session || result; 
+      
+      sessionRef.current = actualSession;
+      
+    } catch (error: any) {
+      console.error('Gemini Live connection error:', error);
+      addLog(`❌ Gemini Live connection failed: ${error.message}`, 'ERROR');
+    }
   };
 
   // --- CAPTURE SCREEN IMAGE ---
@@ -177,7 +305,7 @@ export default function Home() {
           // BARGE-IN: Cancel any ongoing speech
           setMode((currentMode) => {
             if (currentMode === 'SPEAKING') {
-              window.speechSynthesis.cancel();
+              // Note: Gemini Live handles interruption automatically
               addLog('🛑 Interrupted speech to listen', 'VOICE', currentInteractionId);
             }
             return currentMode;
@@ -301,8 +429,7 @@ export default function Home() {
       videoRef.current.srcObject = null;
     }
 
-    // Cancel speech
-    window.speechSynthesis.cancel();
+    // Cancel speech (Gemini Live handles this)
     setMode('IDLE');
     modeRef.current = 'IDLE';
     setIsPaused(false);
@@ -334,7 +461,7 @@ export default function Home() {
           // Ignore errors
         }
       }
-      window.speechSynthesis.cancel();
+      // Note: Gemini Live handles cancellation
       setMode('IDLE');
       modeRef.current = 'IDLE';
     }
@@ -433,7 +560,6 @@ export default function Home() {
 
     // Fix "Awkward Silence" - Wake Word Filter
     const cleanText = transcript.trim().toLowerCase();
-    // Ignore very short triggers or just the name
     if (cleanText.length < 2 || ['drona', 'hey drona', 'hi', 'hello'].includes(cleanText)) {
       addLog('🚫 Ignoring wake word only', 'SYSTEM', interactionId);
       setMode('LISTENING');
@@ -563,72 +689,129 @@ export default function Home() {
           return;
         }
 
-        addLog('📡 Sending request to backend...', 'API', interactionId);
+        addLog('📡 Connecting to Gemini Live...', 'API', interactionId);
 
-        // Call API with text + image
-        const resAnalyze = await fetch('/api/analyze', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ 
-            s3Key: resImg.key, 
-            recordId: dbData.id,
-            userPrompt: transcript
-          })
-        });
-        
-        if (!isValidSession(sessionId)) {
+        // Connect to Gemini Live if not already connected
+        if (!sessionRef.current) {
+          await connectToGemini();
+        }
+
+        if (!sessionRef.current) {
+          addLog('❌ Failed to connect to Gemini Live', 'ERROR', interactionId);
           if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
           setMode('LISTENING');
           modeRef.current = 'LISTENING';
           return;
         }
 
-        // Clear timeout on success
-        if (processingTimeoutRef.current) {
-          clearTimeout(processingTimeoutRef.current);
-          processingTimeoutRef.current = null;
-        }
+        // Convert image to base64
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          const base64Image = (reader.result as string).split(',')[1];
+          
+          // Clear timeout on success
+          if (processingTimeoutRef.current) {
+            clearTimeout(processingTimeoutRef.current);
+            processingTimeoutRef.current = null;
+          }
 
-        const analysis = await resAnalyze.json();
-        const latency = Date.now() - queryStartTimeRef.current;
+          // Reset transcript for new response
+          setLiveTranscript("");
 
-        if (!resAnalyze.ok || analysis.error) {
-          if (isValidSession(sessionId)) {
-            addLog(`❌ Error: ${analysis.error || 'Unknown Error'} (Latency: ${latency}ms)`, 'API', interactionId);
-            updateSessionMessages(currentSessionId, (prev) => [
-              ...prev, 
-              { 
-                role: "system", 
-                content: `Error: ${analysis.error || 'Unknown Error'}` 
+          // 🔴 CRITICAL FIX: reset audio scheduling for this turn
+          if (audioContextRef.current) {
+            nextStartTimeRef.current = audioContextRef.current.currentTime;
+          }
+          
+          // Clear any existing AI message to start fresh
+          if (currentSessionId) {
+            updateSessionMessages(currentSessionId, (prev) => {
+              // Remove last AI message if it exists
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.role === 'ai') {
+                return prev.slice(0, -1);
               }
-            ]);
-            speakResponse("I'm sorry, I encountered an error.", sessionId, interactionId); 
+              return prev;
+            });
           }
-          return;
-        }
 
-        if (!isValidSession(sessionId)) {
-          return;
-        }
+          // --- SMART SEND LOGIC ---
+          try {
+            // 1. Safety Check
+            if (!sessionRef.current) throw new Error('Session is not connected');
 
-        const response = analysis.response || "I am silent."; 
-        addLog(`✅ Response received in ${latency}ms`, 'API', interactionId);
-        addLog(`💡 Drona: "${response.substring(0, 50)}${response.length > 50 ? '...' : ''}"`, 'AI', interactionId);
-        
-        // Add assistant message to chat
-        updateSessionMessages(currentSessionId, (prev) => [
-          ...prev, 
-          { 
-            role: "ai", 
-            content: response 
+            const session = sessionRef.current;
+            let sendFn = session.send;
+
+            // 2. Auto-Fix: If .send() is missing, find the correct method
+            if (typeof sendFn !== 'function') {
+                // Plan A: Check if it's hidden inside the 'conn' property
+                // @ts-ignore
+                if (session.conn && typeof session.conn.send === 'function') {
+                    // @ts-ignore
+                    sendFn = session.conn.send.bind(session.conn);
+                    console.log('⚠️ DEBUG: Using session.conn.send()');
+                }
+                // Plan B: Search the prototype for the correct method name
+                else {
+                    const proto = Object.getPrototypeOf(session);
+                    const methods = Object.getOwnPropertyNames(proto);
+                    
+                    // Look for any method containing 'send'
+                    const candidate = methods.find(m => m.includes('send') && typeof (session as any)[m] === 'function');
+                    
+                    if (candidate) {
+                        // @ts-ignore
+                        sendFn = session[candidate].bind(session);
+                        console.log(`⚠️ DEBUG: Found method '${candidate}', using it.`);
+                    } else {
+                        // Plan C: Last resort, log everything to console to debug
+                        console.log("⚠️ DEBUG PROTOTYPE:", methods);
+                        throw new Error(`SDK Mismatch: No send method found. Own Keys: ${Object.keys(session).join(', ')}`);
+                    }
+                }
+            }
+
+            // 3. Send the message
+            // @ts-ignore
+            await sessionRef.current.send({
+              clientContent: {
+                turns: [
+                  {
+                    role: "user",
+                    parts: [
+                      { text: transcript },
+                      {
+                        inlineData: {
+                          mimeType: "image/jpeg",
+                          data: base64Image,
+                        },
+                      },
+                    ],
+                  },
+                ],
+              },
+            });
+
+            addLog('✅ Sent to Gemini Live', 'API', interactionId);
+            setMode('SPEAKING');
+            modeRef.current = 'SPEAKING';
+
+          } catch (error: any) {
+            console.error('Live Send Error:', error);
+            addLog(`❌ Live Error: ${error.message}`, 'ERROR', interactionId);
+            
+            // Cleanup
+            if (processingTimeoutRef.current) clearTimeout(processingTimeoutRef.current);
+            setMode('LISTENING');
+            modeRef.current = 'LISTENING';
           }
-        ]);
-        
-        speakResponse(response, sessionId, interactionId);
+        }; // End of reader.onloadend
+        reader.readAsDataURL(imageBlob);
 
-      }, 'image/png');
+      }, 'image/png'); // End of canvas.toBlob
 
-    } catch (err: any) {
+    } catch (err: any) { // Catch for outer try
       if (processingTimeoutRef.current) {
         clearTimeout(processingTimeoutRef.current);
         processingTimeoutRef.current = null;
@@ -647,61 +830,8 @@ export default function Home() {
         modeRef.current = 'LISTENING';
       }
     }
-  };
+  }; // End of processActiveQuery
 
-  // --- SPEAK RESPONSE ---
-  const speakResponse = (text: string, sessionId: number, interactionId: number) => {
-    if (!isValidSession(sessionId)) {
-      return;
-    }
-
-    if (!text || text.trim() === "") {
-      if (isValidSession(sessionId)) {
-        addLog('⚠️ Empty response received', 'TTS', interactionId);
-        setMode('LISTENING');
-        modeRef.current = 'LISTENING';
-      }
-      return;
-    }
-
-    setMode('SPEAKING');
-    modeRef.current = 'SPEAKING';
-    addLog('🔄 Transition: PROCESSING -> SPEAKING', 'STATE', interactionId);
-    addLog('🗣️ Started speaking...', 'TTS', interactionId);
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.1;
-    
-    utterance.onend = () => {
-      // 1. Barge-In Check (Keep existing logic)
-      if (interactionId !== interactionCountRef.current) {
-        addLog('🚫 TTS end ignored (New interaction started)', 'TTS', interactionId);
-        return;
-      }
-      
-      // 2. Add "Ear Muff" Cooldown (THE FIX)
-      // Wait 1s before listening again to prevent hearing self-echo
-      setTimeout(() => {
-        if (isValidSession(sessionId) && !isStoppingRef.current && !isPaused) {
-          addLog('🤫 Finished speaking (Cooldown complete)', 'TTS', interactionId);
-          addLog('🔄 Transition: SPEAKING -> LISTENING', 'STATE', interactionId);
-          setMode('LISTENING');
-          modeRef.current = 'LISTENING';
-        }
-      }, 1000);
-    };
-    
-    utterance.onerror = () => {
-      if (isValidSession(sessionId) && !isStoppingRef.current) {
-        addLog('⚠️ Speech error', 'TTS', interactionId);
-        setMode('LISTENING');
-        modeRef.current = 'LISTENING';
-      }
-    };
-    
-    window.speechSynthesis.speak(utterance);
-  };
 
   // --- HANDLE TEXT INPUT (Manual Chat) ---
   const handleSendToAI = useCallback(
@@ -998,6 +1128,10 @@ export default function Home() {
 
         {/* Bottom: Control Buttons */}
         <div className="mt-auto flex flex-col gap-3">
+          {/* Live Transcript Display */}
+          <div className="p-4 bg-gray-900 text-green-400 font-mono h-32 overflow-y-auto border border-gray-700 rounded mb-4">
+            {liveTranscript || <span className="text-gray-600">Waiting for response...</span>}
+          </div>
           {/* --- NEW EXPORT BUTTON --- */}
           <button 
             onClick={handleExportLogs}
